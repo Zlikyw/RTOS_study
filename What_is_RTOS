@@ -1,0 +1,1225 @@
+# **第一课：RTOS 基本原理**
+
+
+
+STM32 + FreeRTOS 入门实战
+
+第一阶段：基础原理
+
+
+
+这一课我们以你的开发环境为基础：
+
+| 项目   | 使用平台                 |
+| ---- | -------------------- |
+| MCU  | STM32F103C8T6        |
+| 开发配置 | STM32CubeMX          |
+| IDE  | Keil MDK             |
+| 编程语言 | C                    |
+| 操作系统 | FreeRTOS             |
+| 下载调试 | ST-LINK V2 / SWD     |
+| 实验目标 | 创建多个任务，实现 LED 不同周期闪烁 |
+
+本课不只是教你如何调用 FreeRTOS API，还要让你理解：**为什么需要 RTOS、RTOS 是如何运行的、任务是如何切换的，以及 MCU 是如何执行多个任务的。**
+
+# **一、先理解什么是 RTOS**
+
+## **1.1 从裸机程序开始理解**
+
+假设我们使用 STM32F103C8T6 开发一个嵌入式设备，需要实现：
+
+- LED 闪烁。
+- 按键检测。
+- UART 串口通信。
+- ADC 采集。
+- CAN 通信。
+
+在没有操作系统的情况下，我们通常使用裸机程序。
+
+典型代码如下：
+
+```
+#include "stm32f1xx_hal.h"
+
+int main(void)
+{
+    HAL_Init();
+
+    SystemClock_Config();
+
+    MX_GPIO_Init();
+    MX_USART1_UART_Init();
+
+    while (1)
+    {
+        LED_Task();
+
+        Key_Task();
+
+        UART_Task();
+
+        ADC_Task();
+
+        CAN_Task();
+    }
+}
+```
+
+这种程序的特点：
+
+1. 所有功能都在主循环中执行。
+2. 程序按照代码顺序执行。
+3. 每个功能都需要主动检查是否需要执行。
+4. 某个函数执行时间过长，会影响后续功能。
+
+例如：
+
+```
+void LED_Task(void)
+{
+    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+
+    HAL_Delay(1000);
+}
+```
+
+这里的 `HAL_Delay(1000)` 会阻塞主循环约 1000ms。
+
+在这段时间内，主循环中的按键、UART、ADC 等任务都不能继续执行。
+
+虽然中断仍然可以发生，但主循环里的其他功能无法及时得到处理。
+
+这就是裸机顺序执行方式的一个局限。
+
+## **1.2 使用 RTOS 解决问题**
+
+RTOS 的核心思想是：
+
+**把一个复杂程序拆分成多个独立任务，由操作系统统一调度。**
+
+例如：
+
+## **裸机程序结构**
+
+**main() 主函数**
+
+LED_Task()
+
+Key_Task()
+
+UART_Task()
+
+ADC_Task()
+
+CAN_Task()
+
+所有功能依次执行，某个功能阻塞时会影响后续功能。
+
+## **RTOS 程序结构**
+
+**FreeRTOS 调度器**
+
+统一管理任务运行
+
+LED Task
+
+Key Task
+
+UART Task
+
+ADC Task
+
+CAN Task
+
+其他任务
+
+每个任务独立运行，调度器根据优先级和任务状态分配 CPU。
+
+例如：
+
+- LED 任务每隔 500ms 执行一次。
+- 按键任务每隔 10ms 扫描一次。
+- UART 任务等待串口数据。
+- CAN 任务等待 CAN 接收事件。
+
+这些任务不再需要全部写在一个 `while(1)` 里面。
+
+## **1.3 RTOS 是如何实现多个任务的？**
+
+这里需要先理解一个重要概念：
+
+STM32F103C8T6 使用的是 ARM Cortex-M3 内核，是单核 MCU。
+
+它在同一时刻只能执行一条 CPU 指令流。
+
+那么为什么我们感觉多个任务同时运行？
+
+原因是：**任务切换（Context Switching，上下文切换）。**
+
+例如：
+
+## **CPU 时间分配示意图**
+
+以下为概念示意，不代表固定的实际执行时间。
+
+**LED**
+
+**UART**
+
+**按键**
+
+**LED**
+
+**UART**
+
+**ADC**
+
+**按键**
+
+**LED**
+
+CPU 时间轴→ 时间
+
+假设：
+
+1. CPU 正在执行 LED 任务。
+2. LED 任务进入延时状态。
+3. 调度器发现 UART 任务已经就绪。
+4. CPU 开始执行 UART 任务。
+5. UART 任务等待数据，进入阻塞状态。
+6. CPU 转而执行按键任务。
+
+这样就实现了多个任务交替运行。
+
+注意：如果一个高优先级任务始终不阻塞、不让出 CPU，它就可能一直占用 CPU，低优先级任务也就无法得到执行机会。
+
+# **二、RTOS 的核心组成部分**
+
+学习 FreeRTOS，第一阶段需要掌握六个概念：
+
+1. Task：任务。
+2. Scheduler：调度器。
+3. Priority：任务优先级。
+4. Task State：任务状态。
+5. Context Switching：上下文切换。
+6. Tick：系统节拍。
+
+我们逐个理解。
+
+## **2.1 Task（任务）**
+
+任务是 RTOS 最基本的运行单位。
+
+在 FreeRTOS 中，一个任务本质上是一个具有独立任务堆栈和任务控制信息的执行实体。
+
+例如：
+
+```
+void LED_Task(void *argument)
+{
+    while (1)
+    {
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+```
+
+这里的 `LED_Task` 就是一个任务函数。
+
+注意它与普通 C 函数的区别：
+
+| 普通函数        | RTOS 任务函数 |
+| ----------- | --------- |
+| 调用后执行       | 由调度器安排执行  |
+| 执行完返回调用者    | 通常持续运行    |
+| 使用调用者的执行上下文 | 有独立任务堆栈   |
+| 不需要设置优先级    | 创建时设置优先级  |
+
+任务函数通常采用：
+
+```
+void Task_Name(void *argument)
+{
+    while (1)
+    {
+        /* 任务执行内容 */
+    }
+}
+```
+
+为什么通常使用 `while(1)`？
+
+因为任务需要持续运行，等待调度器反复安排执行。
+
+如果任务函数直接执行结束，任务就会退出。FreeRTOS 要求任务函数不要简单地返回；如果需要结束，应调用 `vTaskDelete(NULL)`。
+
+## **2.2 Scheduler（调度器）**
+
+调度器是 RTOS 的核心。
+
+它负责：
+
+- 判断哪些任务可以运行。
+- 比较任务优先级。
+- 选择下一个运行任务。
+- 进行任务切换。
+
+FreeRTOS 启动调度器的函数：
+
+```
+vTaskStartScheduler();
+```
+
+调用后，FreeRTOS 开始管理任务运行。
+
+一般情况下，启动调度器之后，程序不会再按照普通裸机程序的方式继续执行主函数后面的业务代码。
+
+## **2.3 Priority（任务优先级）**
+
+任务优先级表示任务的重要程度。
+
+FreeRTOS 中，数值越大，优先级越高。
+
+例如：
+
+| 任务       | 优先级 |
+| -------- | --- |
+| CAN 接收处理 | 4   |
+| 传感器采集    | 3   |
+| UART 通信  | 2   |
+| LED 闪烁   | 1   |
+
+假设：
+
+- CAN 任务优先级为 4。
+- LED 任务优先级为 1。
+
+当两个任务都处于就绪状态时，通常优先执行 CAN 任务。
+
+这里要注意：高优先级并不意味着每时每刻都运行。如果高优先级任务处于阻塞状态，低优先级的就绪任务仍然可以运行。
+
+## **2.4 Task State（任务状态）**
+
+FreeRTOS 任务有四种主要状态：
+
+## **FreeRTOS 任务状态**
+
+**Running（运行态）**
+
+当前正在使用 CPU
+
+等待时间或事件
+
+**Blocked**
+
+阻塞态
+
+被挂起
+
+**Suspended**
+
+挂起态
+
+**Ready（就绪态）**
+
+已经准备好，等待 CPU
+
+概念图：实际任务状态转换取决于调度事件、延时到期及任务恢复操作。
+
+四种状态分别是：
+
+| 状态        | 含义          |
+| --------- | ----------- |
+| Running   | 正在运行        |
+| Ready     | 等待 CPU 调度   |
+| Blocked   | 等待时间或某个事件   |
+| Suspended | 被主动挂起，不参与调度 |
+
+例如：
+
+```
+vTaskDelay(pdMS_TO_TICKS(1000));
+```
+
+执行后，当前任务进入 Blocked 状态，延时结束后重新进入 Ready 状态。
+
+注意：在单核 MCU 中，同一时刻最多只有一个任务处于 Running 状态。
+
+## **2.5 Context Switching（上下文切换）**
+
+这是 RTOS 最重要的底层原理之一。
+
+假设 CPU 正在执行任务 A，现在需要切换到任务 B。
+
+CPU 需要做什么？
+
+1. 保存任务 A 当前的 CPU 寄存器状态。
+2. 保存任务 A 的堆栈指针。
+3. 获取任务 B 上次保存的堆栈指针。
+4. 恢复任务 B 的寄存器状态。
+5. 从任务 B 上次暂停的位置继续执行。
+
+这就是上下文切换。
+
+[Cortex-M3 Context Switching - IAmAProgrammer - 博客园](https://images.openai.com/static-rsc-4/NrkS_wMuCuLh2S3IXiYdwbwXPmFNHr5SF8F0KpeO7vGKTOW7TTV8eEZEHxS1C75sktUB1KsxmoMCXLEbbQwR_818t95uxazEPW7f5vUcQzFeFy_LrMAxUv655iQNe0EBtuD0XhCfD6P7CsFCc6pPXtVh3v4bPgkUBhDoIyHPyUg?purpose=inline)
+
+[cnblogs.com](https://www.cnblogs.com/shangdawei/p/3507794.html?utm_source=chatgpt.com)
+
+在 STM32F103（Cortex-M3）上，FreeRTOS 通常利用以下机制：
+
+- SysTick：产生系统节拍。
+- PendSV：执行任务上下文切换。
+- SVC：启动调度器时使用的系统调用机制。
+
+这部分暂时不需要你研究汇编代码，但一定要理解其工作原理。后续我们会单独深入讲解。
+
+## **2.6 Tick（系统节拍）**
+
+RTOS 需要一个时间基准来管理任务延时和调度。
+
+这个时间基准叫 Tick。
+
+例如：
+
+如果系统 Tick 频率设置为 1000Hz：
+
+\\[ T=\frac{1}{1000}=1ms \\]
+
+那么系统每隔约 1ms 产生一次 Tick。
+
+FreeRTOS 可以通过 Tick 计算任务延时。
+
+例如：
+
+```
+vTaskDelay(500);
+```
+
+如果 Tick 频率是 1000Hz，参数 500 表示 500 个 Tick，约等于 500ms。
+
+更推荐使用：
+
+```
+vTaskDelay(pdMS_TO_TICKS(500));
+```
+
+这样不需要自己换算 Tick。
+
+注意：任务延时是相对延时，不保证任务每次执行都严格精确到 500ms。需要稳定周期时，后面要学习 `vTaskDelayUntil()`。
+
+# **三、STM32CubeMX 配置 FreeRTOS**
+
+理论知识已经了解，接下来进入实际配置。
+
+我们的目标是让 STM32F103C8T6 创建两个任务：
+
+- LED1_Task：每隔 500ms 翻转一次 LED。
+- LED2_Task：每隔 1000ms 翻转一次 LED。
+
+为了方便实验，先使用板载 LED 和一个外接 LED。
+
+## **3.1 新建 STM32CubeMX 工程**
+
+打开 STM32CubeMX：
+
+1. 点击 `ACCESS TO MCU SELECTOR`。
+2. 搜索 `STM32F103C8T6`。
+3. 选择对应 MCU。
+4. 点击 Start Project。
+
+[第6章 创建FreeRTOS工程 | 百问网](https://images.openai.com/static-rsc-4/dchR4L4pIgrTjds9U-zHUBaSchTs4gtxsa9qr4Q5h3pjud2cAgX_U5x5YHeGbhGbFea7mzFJ6M0x9M4MjoTob41wMg5SxQgq2G6LzkRGFrLQrWy0En0niuP8BvYrlS7pXj8e8cyHKebp5PhxLz7sgIpKAoPwDBBX5v74-nsyDDI?purpose=inline)
+
+[rtos.100ask.net](https://rtos.100ask.net/docs/DShanMCU-F103/chapter6/?utm_source=chatgpt.com)
+
+## **3.2 配置 GPIO**
+
+在 Pinout & Configuration 页面：
+
+配置 PC13：
+
+| 参数                     | 配置                          |
+| ---------------------- | --------------------------- |
+| GPIO Mode              | Output Push Pull            |
+| GPIO Pull-up/Pull-down | No pull-up and no pull-down |
+| Maximum output speed   | Low                         |
+| User Label             | LED1                        |
+
+再配置 PB0：
+
+| 参数                     | 配置                          |
+| ---------------------- | --------------------------- |
+| GPIO Mode              | Output Push Pull            |
+| GPIO Pull-up/Pull-down | No pull-up and no pull-down |
+| Maximum output speed   | Low                         |
+| User Label             | LED2                        |
+
+[GPIO 输出 - Elec Wiki](https://images.openai.com/static-rsc-4/22kRzRBGzswBH1rtxcIcT7ILjulwWkg87ZfFONX_xa-npEqrBwEt1knotZtuue-0tg22xj29sc-X3tacwO6vabAKMbbytwc2V-1sSjwqo_PRCgI-FWeGug9vZDD11aZED67ulLzj6v2GX5DzcQ-7_qo2voenFpZfBiTsrOVfsYc?purpose=inline)
+
+[elec.alampy.com](https://elec.alampy.com/stm32/gpio/output/?utm_source=chatgpt.com)
+
+注意：
+
+常见 Blue Pill 开发板的 PC13 板载 LED 是低电平点亮，高电平熄灭。
+
+外接 LED 建议串联限流电阻，并根据实际接线确认有效电平。
+
+## **3.3 配置系统时钟**
+
+进入 Clock Configuration 页面。
+
+建议配置：
+
+| 参数               | 数值    |
+| ---------------- | ----- |
+| HSE              | 8MHz  |
+| PLL Source       | HSE   |
+| PLL Mul          | ×9    |
+| SYSCLK           | 72MHz |
+| AHB              | 72MHz |
+| APB1             | 36MHz |
+| APB2             | 72MHz |
+| APB1 Timer Clock | 72MHz |
+
+[【STM32】HAL库 STM32CubeMX教程十—DAC「建议收藏」-腾讯云开发者社区-腾讯云](https://images.openai.com/static-rsc-4/mhqNMuHrPJ6QJ3TvGrWI3v1GarrAL7pLifYSDYWPIDr86gCUAqdBysIdOt_ilyx9Ib846nzEjzjqevcjmQqqptaCt2muXx1Fz_hcd7fgraDy872moR9H2tznJJp9RJoVHLGX0Au1hxElqw2w0EvWrFjzDYWdd7hKlxFPFfTqjWg?purpose=inline)
+
+[cloud.tencent.com](https://cloud.tencent.com/developer/article/2070317?utm_source=chatgpt.com)
+
+这里为什么要配置 72MHz？
+
+因为 STM32F103C8T6 常见的最高系统时钟频率是 72MHz。
+
+另外，APB1 总线分频为 2 时，其定时器时钟通常会恢复为 72MHz。这一点后续学习定时器时也会用到。
+
+## **3.4 配置 FreeRTOS**
+
+进入：
+
+`Middleware and Software Packs → FREERTOS`
+
+启用 FreeRTOS。
+
+[How to use FreeRTOS™ with STM32CubeMX2 - STMicroelectronics Community](https://images.openai.com/static-rsc-4/4Fk80qrwkfFbg-YFSaGdfNtTCaqyXnBh10-hpRJs6W0OTW3NLufz683mgjLFOsaPXAuPuwn3K4xzP_F9n1s5MMIzdo7gHZdmXqQ5x-15hcZ5PutvRr4AjyP1OohGf8thr1FzvP2eZz8I11LOOymV4inOu1gmMWW8-vI2bJB1OC8?purpose=inline)
+
+[community.st.com](https://community.st.com/t5/stm32-mcus/how-to-use-freertos-with-stm32cubemx2/ta-p/873175?utm_source=chatgpt.com)
+
+这里需要特别注意 Interface 的选择。
+
+不同 CubeMX 版本可能显示：
+
+- CMSIS_V1
+- CMSIS_V2
+- 或者其他接口选项。
+
+本课程建议使用 CMSIS_V2 接口，并在任务函数中使用 FreeRTOS 原生 API。
+
+这样既能学习标准 FreeRTOS API，也能兼容 CubeMX 常见的代码生成结构。
+
+### **配置几个关键参数**
+
+进入 FreeRTOS Configuration 页面，重点检查：
+
+| 参数                 | 建议设置          | 说明          |
+| ------------------ | ------------- | ----------- |
+| CPU Clock          | 72000000      | CPU 时钟      |
+| Tick Rate          | 1000Hz        | 1ms 一个 Tick |
+| Max Priorities     | 5 或以上         | 优先级数量       |
+| Minimal Stack Size | 默认值起步         | 最小任务堆栈      |
+| Total Heap Size    | 4096 Bytes 起步 | RTOS 动态内存   |
+
+这里的 Heap Size 是初始实验建议值，不是所有项目的固定配置。STM32F103C8T6 只有 20KB SRAM，还需要给全局变量、HAL、任务堆栈和其他数据留出空间。
+
+**特别注意：**
+
+FreeRTOS 的任务堆栈大小通常以 `StackType_t` 数量为单位，而不是字节。
+
+例如：
+
+```
+xTaskCreate(
+    LED1_Task,
+    "LED1",
+    128,
+    NULL,
+    1,
+    NULL
+);
+```
+
+在 Cortex-M3 上，`StackType_t` 通常为 4 字节，因此这里的 128 通常表示 512 字节的任务栈，而不是 128 字节。
+
+## **3.5 配置 NVIC 和中断优先级**
+
+FreeRTOS 对 Cortex-M3 的中断优先级有特殊要求。
+
+重点检查：
+
+- `configPRIO_BITS`
+- `configLIBRARY_LOWEST_INTERRUPT_PRIORITY`
+- `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY`
+
+STM32F103 通常使用 4 位 NVIC 优先级，共 16 个优先级等级。
+
+初学阶段先使用 CubeMX 生成的 FreeRTOS 中断优先级配置，不要随意修改。
+
+后续学习 UART、CAN 中断与 FreeRTOS 通信时，再深入理解这部分。
+
+## **3.6 生成 Keil 工程**
+
+进入 Project Manager：
+
+| 参数               | 设置            |
+| ---------------- | ------------- |
+| Project Name     | RTOS_Lesson01 |
+| Toolchain / IDE  | MDK-ARM       |
+| Firmware Package | STM32F1 HAL   |
+
+然后点击 Generate Code。
+
+使用 Keil 打开生成的 `.uvprojx` 工程。
+
+至此，基础工程就建立完成了。
+
+# **四、编写第一个 FreeRTOS 程序**
+
+现在开始编写代码。
+
+本实验采用 CubeMX 常见的 CMSIS_V2 工程结构：
+
+- CubeMX 负责初始化 HAL、GPIO 和 FreeRTOS。
+- 我们使用 FreeRTOS 原生 API 创建两个任务。
+- 使用 CubeMX 生成的 `osKernelStart()` 启动调度器。
+
+**注意：CMSIS_V2 工程中不要再额外调用&#x20;**`vTaskStartScheduler()`**，否则会重复启动调度器。**
+
+## **4.1 main.c 主函数结构**
+
+CubeMX 生成的 `main.c` 中，主函数通常类似这样：
+
+```
+int main(void)
+{
+    HAL_Init();
+
+    SystemClock_Config();
+
+    MX_GPIO_Init();
+
+    MX_FREERTOS_Init();
+
+    osKernelStart();
+
+    while (1)
+    {
+    }
+}
+```
+
+其中：
+
+| 函数                     | 作用          |
+| ---------------------- | ----------- |
+| `HAL_Init()`           | 初始化 HAL 库   |
+| `SystemClock_Config()` | 配置系统时钟      |
+| `MX_GPIO_Init()`       | 初始化 GPIO    |
+| `MX_FREERTOS_Init()`   | 创建 RTOS 任务  |
+| `osKernelStart()`      | 启动 RTOS 调度器 |
+
+注意：不同 CubeMX 版本生成的代码结构可能略有差异。如果生成了 `osKernelInitialize()`，应保留其原有位置，通常先初始化内核，再创建任务，最后启动调度器。
+
+## **4.2 编写任务代码**
+
+在 `main.c` 中添加头文件：
+
+```
+#include "FreeRTOS.h"
+#include "task.h"
+```
+
+如果你的工程没有通过其他头文件包含 `FreeRTOS.h` 和 `task.h`，就需要显式添加。
+
+接着添加两个任务函数：
+
+```
+/* LED1任务 */
+void LED1_Task(void *argument)
+{
+    while (1)
+    {
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+/* LED2任务 */
+void LED2_Task(void *argument)
+{
+    while (1)
+    {
+        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+```
+
+这里有两个核心函数：
+
+**1. HAL_GPIO_TogglePin()**
+
+```
+HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+```
+
+作用：翻转 GPIO 电平。
+
+如果原来是高电平，就变成低电平；如果原来是低电平，就变成高电平。
+
+**2. vTaskDelay()**
+
+```
+vTaskDelay(pdMS_TO_TICKS(500));
+```
+
+作用：让当前任务进入阻塞状态约 500ms。
+
+注意：延时期间，CPU 可以执行其他就绪任务。
+
+## **4.3 创建任务**
+
+在 CubeMX 生成的 `freertos.c` 中，一般可以找到：
+
+```
+void MX_FREERTOS_Init(void)
+{
+    /* USER CODE BEGIN Init */
+
+    /* USER CODE END Init */
+
+    /* USER CODE BEGIN RTOS_THREADS */
+
+    /* USER CODE END RTOS_THREADS */
+}
+```
+
+在用户代码区域创建任务：
+
+```
+void MX_FREERTOS_Init(void)
+{
+    /* USER CODE BEGIN Init */
+
+    /* USER CODE END Init */
+
+    /* USER CODE BEGIN RTOS_THREADS */
+
+    xTaskCreate(
+        LED1_Task,
+        "LED1",
+        128,
+        NULL,
+        1,
+        NULL
+    );
+
+    xTaskCreate(
+        LED2_Task,
+        "LED2",
+        128,
+        NULL,
+        1,
+        NULL
+    );
+
+    /* USER CODE END RTOS_THREADS */
+}
+```
+
+如果你的工程生成了默认任务，也可以暂时保留，但建议初学时删除不需要的默认任务配置，避免干扰观察。
+
+注意：如果使用 `freertos.c`，任务函数需要在该文件中定义，或者在头文件中声明后再调用。不要在两个 C 文件中重复定义同一个任务函数。
+
+## **4.4 完整任务代码**
+
+为了避免文件之间的函数声明问题，下面给出一份可以直接放在 `main.c` 用户代码区域的任务定义和创建代码。
+
+```
+#include "main.h"
+#include "FreeRTOS.h"
+#include "task.h"
+
+/* 任务函数声明 */
+void LED1_Task(void *argument);
+void LED2_Task(void *argument);
+
+/* LED1任务 */
+void LED1_Task(void *argument)
+{
+    while (1)
+    {
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+/* LED2任务 */
+void LED2_Task(void *argument)
+{
+    while (1)
+    {
+        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+/* 创建任务 */
+void MX_FREERTOS_Init(void)
+{
+    xTaskCreate(
+        LED1_Task,
+        "LED1",
+        128,
+        NULL,
+        1,
+        NULL
+    );
+
+    xTaskCreate(
+        LED2_Task,
+        "LED2",
+        128,
+        NULL,
+        1,
+        NULL
+    );
+}
+```
+
+这段代码展示了任务创建和运行逻辑。实际工程中，`MX_FREERTOS_Init()` 通常由 CubeMX 在 `freertos.c` 中生成，因此请将任务函数和任务创建语句分别放到对应文件的用户代码区域，不要再复制一份同名函数。
+
+另外，建议检查 `xTaskCreate()` 的返回值，正式项目中要判断任务创建是否成功。
+
+例如：
+
+```
+BaseType_t ret;
+
+ret = xTaskCreate(
+    LED1_Task,
+    "LED1",
+    128,
+    NULL,
+    1,
+    NULL
+);
+
+if (ret != pdPASS)
+{
+    Error_Handler();
+}
+```
+
+## **4.5 代码逐行解释**
+
+以这段代码为例：
+
+```
+xTaskCreate(
+    LED1_Task,
+    "LED1",
+    128,
+    NULL,
+    1,
+    NULL
+);
+```
+
+它一共有六个参数：
+
+| 参数    | 含义     | 本实验配置     |
+| ----- | ------ | --------- |
+| 第 1 个 | 任务函数入口 | LED1_Task |
+| 第 2 个 | 任务名称   | LED1      |
+| 第 3 个 | 任务堆栈深度 | 128       |
+| 第 4 个 | 任务参数   | NULL      |
+| 第 5 个 | 任务优先级  | 1         |
+| 第 6 个 | 任务句柄   | NULL      |
+
+再看：
+
+```
+vTaskDelay(pdMS_TO_TICKS(500));
+```
+
+它的工作流程：
+
+1. 当前任务请求延时 500ms。
+2. FreeRTOS 将任务设置为 Blocked 状态。
+3. 调度器选择其他 Ready 状态的任务运行。
+4. 延时到期后，任务重新进入 Ready 状态。
+5. 当调度器选择它时，继续执行。
+
+**这就是 RTOS 与裸机&#x20;**`HAL_Delay()`**&#x20;在程序组织方式上的一个重要区别。**
+
+# **五、实验验证：观察两个任务是否独立运行**
+
+现在进行实验。
+
+## **5.1 编译和下载**
+
+在 Keil 中：
+
+1. 点击 Build，编译工程。
+2. 检查是否存在编译错误。
+3. 使用 ST-LINK V2 连接 STM32。
+4. 选择 SWD 下载方式。
+5. 点击 Download 下载程序。
+6. 复位开发板。
+
+如果下载器仍然提示 `No ULINK2/ME Device found`，需要检查 Keil 的 Debug 和 Utilities 是否都选择了 ST-Link Debugger，而不是 ULINK。
+
+## **5.2 预期实验结果**
+
+## **LED 任务运行效果**
+
+**LED1（PC13）**
+
+500ms 翻转一次
+
+0ms
+
+500ms
+
+1000ms
+
+**LED2（PB0）**
+
+1000ms 翻转一次
+
+0ms
+
+500ms
+
+1000ms
+
+示意图：LED1 每 500ms 翻转，LED2 每 1000ms 翻转。实际初始亮灭状态取决于 GPIO 初始电平。
+
+这里需要特别理解：
+
+`500ms` 是 LED1 两次翻转之间的间隔，不是完整的闪烁周期。
+
+因此：
+
+- LED1 完整亮灭周期约 1000ms。
+- LED2 完整亮灭周期约 2000ms。
+
+## **5.3 如何证明两个任务真的在运行？**
+
+建议使用 Keil 调试功能。
+
+在任务函数中设置断点：
+
+```
+void LED1_Task(void *argument)
+{
+    while (1)
+    {
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+```
+
+在 `HAL_GPIO_TogglePin()` 处设置断点。
+
+然后观察：
+
+- LED1_Task 是否反复执行。
+- LED2_Task 是否反复执行。
+- 两个任务是否交替获得 CPU。
+
+注意：断点会暂停 CPU，因此实际 LED 闪烁周期会被影响。验证任务调度后，建议移除断点，再观察实际运行效果。
+
+# **六、深入理解：为什么任务延时不会阻塞其他任务？**
+
+这是本课最重要的知识点之一。
+
+我们做一个思考实验。
+
+假设：
+
+```
+void Task_A(void *argument)
+{
+    while (1)
+    {
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+```
+
+```
+void Task_B(void *argument)
+{
+    while (1)
+    {
+        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+```
+
+两个任务都调用了 `vTaskDelay()`。
+
+那么当 Task_A 延时时，Task_B 会怎样？
+
+答案是：Task_B 可以获得 CPU 运行。
+
+我们用一个时间流程理解：
+
+| 时间     | Task_A  | Task_B          |
+| ------ | ------- | --------------- |
+| 0ms    | Running | Ready           |
+| 0ms 后  | Blocked | Running         |
+| 500ms  | Ready   | Running 或 Ready |
+| 1000ms | 视调度情况   | 进入下一轮           |
+
+表格是简化示意，实际哪个任务先运行还受到优先级、Tick 和任务切换时机影响。
+
+这里需要记住一个原则：
+
+**任务调用&#x20;**`vTaskDelay()`**&#x20;后，不是让整个 MCU 停止，而是让当前任务暂时不参与 CPU 竞争。**
+
+这也是 RTOS 非常重要的设计思想。
+
+## **6.1 进一步理解优先级**
+
+现在我们修改任务创建代码：
+
+```
+xTaskCreate(
+    LED1_Task,
+    "LED1",
+    128,
+    NULL,
+    2,
+    NULL
+);
+
+xTaskCreate(
+    LED2_Task,
+    "LED2",
+    128,
+    NULL,
+    1,
+    NULL
+);
+```
+
+此时：
+
+- LED1 优先级为 2。
+- LED2 优先级为 1。
+
+LED1 的优先级更高。
+
+当两个任务都处于 Ready 状态时，LED1 通常优先获得 CPU。
+
+但是 LED1 执行：
+
+```
+vTaskDelay(pdMS_TO_TICKS(500));
+```
+
+进入 Blocked 状态后，LED2 就可以获得 CPU。
+
+这说明：
+
+**高优先级任务不一定一直占用 CPU，关键在于任务当前处于什么状态。**
+
+# **七、常见错误及排查方法**
+
+初学 FreeRTOS 时，经常会遇到下面这些问题。
+
+| 问题                  | 可能原因                 | 排查方向                       |
+| ------------------- | -------------------- | -------------------------- |
+| 编译找不到 `FreeRTOS.h`  | 头文件路径错误              | 检查 Include Paths           |
+| 编译找不到 `xTaskCreate` | 没有包含 task.h 或内核源码未加入 | 检查头文件及工程文件                 |
+| 下载成功但 LED 不亮        | GPIO 配置错误            | 检查引脚和有效电平                  |
+| 任务无法创建              | Heap 不足              | 检查 `configTOTAL_HEAP_SIZE` |
+| 程序进入 HardFault      | 堆栈溢出或配置错误            | 检查任务栈、异常调用                 |
+| 调度器启动失败             | RTOS 中断配置错误          | 检查 SysTick、PendSV、SVC      |
+| LED 闪烁周期不正确         | Tick 频率或延时参数不正确      | 检查 `configTICK_RATE_HZ`    |
+
+## **7.1 找不到 FreeRTOS.h**
+
+例如出现：
+
+```
+fatal error: FreeRTOS.h: No such file or directory
+```
+
+解决方法：
+
+检查 Keil：
+
+`Options for Target → C/C++ → Include Paths`
+
+确认已经包含 FreeRTOS 的头文件目录。
+
+常见目录包括：
+
+```
+Middlewares/Third_Party/FreeRTOS/Source/include
+Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2
+```
+
+实际路径根据 CubeMX 版本和生成目录而不同。
+
+## **7.2 任务创建失败**
+
+如果：
+
+```
+xTaskCreate(...) != pdPASS
+```
+
+说明任务创建没有成功。
+
+优先检查：
+
+```
+#define configTOTAL_HEAP_SIZE
+```
+
+这个参数控制 FreeRTOS 动态内存堆大小。
+
+STM32F103C8T6 的 SRAM 只有 20KB，因此不能无限增加。
+
+## **7.3 程序进入 HardFault**
+
+重点检查：
+
+1. 任务堆栈是否过小。
+2. FreeRTOS 配置文件是否正确。
+3. 中断优先级是否符合 FreeRTOS 要求。
+4. 是否错误地在 ISR 中调用普通任务 API。
+5. 是否发生数组越界或内存破坏。
+
+## **7.4 调度器无法正常运行**
+
+如果程序启动后没有任务运行，检查：
+
+- 是否调用了 `osKernelStart()`。
+- 是否重复启动了调度器。
+- 是否成功创建任务。
+- FreeRTOS 的 SysTick、PendSV、SVC 是否配置正确。
+- 是否存在优先级配置冲突。
+
+# **八、本课知识总结**
+
+今天我们学习了 RTOS 的基础原理，整理一下需要掌握的重点。
+
+| 知识点               | 必须掌握的内容                         |
+| ----------------- | ------------------------------- |
+| RTOS              | 实时操作系统的基本概念                     |
+| Task              | 任务是什么，如何创建任务                    |
+| Scheduler         | 调度器的作用                          |
+| Priority          | 任务优先级及抢占                        |
+| Task State        | Running、Ready、Blocked、Suspended |
+| Context Switching | 上下文切换原理                         |
+| Tick              | 系统节拍和时间管理                       |
+| vTaskDelay        | 任务延时与阻塞                         |
+
+**关于本次实验代码，再强调一个工程结构问题：**
+
+建议最终按照以下方式组织代码：
+
+```
+RTOS_Lesson01
+│
+├── Core
+│   ├── Inc
+│   │   ├── main.h
+│   │   └── freertos.h
+│   │
+│   └── Src
+│       ├── main.c
+│       ├── freertos.c
+│       └── stm32f1xx_it.c
+│
+└── Middlewares
+    └── Third_Party
+        └── FreeRTOS
+```
+
+- `main.c`：完成 HAL、时钟、GPIO、内核初始化和 `osKernelStart()`。
+- `freertos.c`：定义 LED1_Task、LED2_Task，并在 `MX_FREERTOS_Init()` 中调用 `xTaskCreate()`。
+- `FreeRTOS`：提供任务调度、延时、队列等内核功能。
+
+这样既能保留 CubeMX 的代码生成结构，也方便以后维护项目。
+
+# **九、课后练习**
+
+建议你亲自完成下面三个练习，检查是否真正理解了任务调度。
+
+**第一课知识检测**
+
+0/3 已作答
+
+**1. 如果 Task_A 调用 vTaskDelay(1000)，Task_B 会怎样？**
+
+整个 MCU 停止运行
+
+Task_B 可以获得 CPU 执行机会
+
+Task_B 自动删除
+
+**2. FreeRTOS 中，优先级数值越大代表什么？**
+
+优先级越低
+
+优先级越高
+
+任务堆栈越大
+
+**3. STM32F103C8T6 是单核 MCU，如何实现多个任务交替运行？**
+
+多个任务真正同时执行
+
+通过上下文切换共享 CPU
+
+每个任务使用一个 CPU
+
+提交答案
+
+## **下一课预告**
+
+第二课
+
+# **STM32CubeMX 集成 FreeRTOS**
+
+[22.2-任务的创建(有代码示例) FreeRTOS 项目 FreeRTOS学习笔记 FreeRTOS移植 FreeRTOS开源项目 FreeRTOS面试题汇总FreeRTOS项目实战F103 - 好家伙VCC - 博客园](https://images.openai.com/static-rsc-4/Rx8AjK800mtjU5hnD_UF-a2fzRBRpiR2inrrUXq0KyTo8YOzHRBFfOJZTixRWR_K9bn2edhBm4LIbnJt-rknf5pm_zOg6dDKEeV1Lm0RSuSWqhA9ZKNv8qZxnJ-YBfgC0CNjzelolALa0VhUE0s9NIZY5iHOFR9mz2df_xmxkao?purpose=inline)
+
+[cnblogs.com](https://www.cnblogs.com/haojiahuoVCC/articles/18800157?utm_source=chatgpt.com)
+
+下一课我们将重点学习：
+
+1. CubeMX 如何添加 FreeRTOS。
+2. CMSIS_V1 和 CMSIS_V2 有什么区别。
+3. FreeRTOSConfig.h 每个重要参数的含义。
+4. SysTick、PendSV、SVC 如何配置。
+5. Heap、Stack、Tick Rate 如何计算。
+6. 生成 Keil 工程并运行第一个 FreeRTOS 程序。
+
+**下一课的目标：不只是会配置，还要知道每一个参数为什么这样设置。**
+
+建议先完成本课的双 LED 实验。如果能让两个 LED 按照不同周期独立闪烁，并且理解 `vTaskDelay()` 为什么不会阻塞其他任务，就可以进入第二课了。
